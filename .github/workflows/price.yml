@@ -1,0 +1,59 @@
+name: Gold Price Telegram Bot
+
+on:
+  schedule:
+    - cron: '5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  price-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get repository files
+        uses: actions/checkout@v6
+
+      - name: Find and extract bot
+        run: |
+          ZIP=$(find . -maxdepth 1 -type f -name 'gold_price_telegram_bot_ready*.zip' | head -n 1)
+          if [ -z "$ZIP" ]; then
+            echo "Bot ZIP not found"
+            exit 1
+          fi
+          unzip -o "$ZIP"
+
+      - name: Install Python packages
+        run: |
+          python -m pip install -r requirements.txt
+
+      - name: Run bot once
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ARZBIN_API_KEY: ${{ secrets.ARZBIN_API_KEY }}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path("bot.py")
+          s = p.read_text(encoding="utf-8")
+
+          marker = 'if __name__ == "__main__":'
+          if marker in s:
+              s = s[:s.index(marker)] + '''if __name__ == "__main__":
+              publish()
+              '''
+              p.write_text(s, encoding="utf-8")
+          PY
+
+          python bot.py
+
+      - name: Save previous prices
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add last_prices.json
+          git commit -m "Update previous prices" || true
+          git push

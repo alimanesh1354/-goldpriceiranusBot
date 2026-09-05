@@ -16,39 +16,190 @@ jobs:
       - name: Get repository files
         uses: actions/checkout@v6
 
-      - name: Find and extract bot
+      - name: Install Python
         run: |
-          ZIP=$(find . -maxdepth 1 -type f -name 'gold_price_telegram_bot_ready*.zip' | head -n 1)
-          if [ -z "$ZIP" ]; then
-            echo "Bot ZIP not found"
-            exit 1
-          fi
-          unzip -o "$ZIP"
+          python -m pip install requests
 
-      - name: Install Python packages
-        run: |
-          python -m pip install -r requirements.txt
-
-      - name: Run bot once
+      - name: Get prices and send Telegram message
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ARZBIN_API_KEY: ${{ secrets.ARZBIN_API_KEY }}
         run: |
           python - <<'PY'
-          from pathlib import Path
+          import os
+          import json
+          import requests
+          from datetime import datetime
 
-          p = Path("bot.py")
-          s = p.read_text(encoding="utf-8")
+          BOT_TOKEN = os.environ["BOT_TOKEN"]
+          API_KEY = os.environ["ARZBIN_API_KEY"]
+          CHANNEL = "@gold_price_Iran_us"
 
-          marker = 'if __name__ == "__main__":'
-          if marker in s:
-              s = s[:s.index(marker)] + '''if __name__ == "__main__":
-              publish()
-              '''
-              p.write_text(s, encoding="utf-8")
+          BASE = "https://hub.arzbin.com"
+
+          HEADERS = {
+              "Authorization": f"Bearer {API_KEY}",
+              "Accept": "application/json"
+          }
+
+          def get_json(path):
+              r = requests.get(
+                  BASE + path,
+                  headers=HEADERS,
+                  timeout=30
+              )
+              r.raise_for_status()
+              return r.json()
+
+          rates = get_json("/api/v1/market/rates")
+          gold = get_json("/api/v1/market/gold")
+          crypto = get_json("/api/v1/market/crypto")
+
+          def items(obj):
+              if isinstance(obj, dict):
+                  if isinstance(obj.get("data"), list):
+                      return obj["data"]
+                  return [obj]
+              if isinstance(obj, list):
+                  return obj
+              return []
+
+          def find_item(data, words):
+              for item in items(data):
+                  if not isinstance(item, dict):
+                      continue
+
+                  text = " ".join(
+                      str(item.get(k, ""))
+                      for k in ["code", "name", "symbol", "type"]
+                  ).lower()
+
+                  if all(w.lower() in text for w in words):
+                      return item
+              return None
+
+          def value(item):
+              if not item:
+                  return None
+
+              for key in ["sell", "price", "value", "rate"]:
+                  if key in item and item[key] is not None:
+                      try:
+                          return float(item[key])
+                      except:
+                          pass
+
+              return None
+
+          usd = value(find_item(rates, ["USD"]))
+          eur = value(find_item(rates, ["EUR"]))
+
+          ounce_item = (
+              find_item(gold, ["ounce"])
+              or find_item(gold, ["XAU"])
+          )
+
+          gold18_item = (
+              find_item(gold, ["18"])
+              or find_item(gold, ["18k"])
+          )
+
+          usdt_item = (
+              find_item(crypto, ["USDT"])
+              or find_item(crypto, ["Tether"])
+          )
+
+          ounce = value(ounce_item)
+          gold18 = value(gold18_item)
+          usdt = value(usdt_item)
+
+          missing = []
+
+          for name, val in [
+              ("USD", usd),
+              ("EUR", eur),
+              ("اونس طلا", ounce),
+              ("طلای ۱۸ عیار", gold18),
+              ("تتر", usdt)
+          ]:
+              if val is None:
+                  missing.append(name)
+
+          if missing:
+              raise RuntimeError(
+                  "قیمت پیدا نشد: " + ", ".join(missing)
+              )
+
+          STATE = "last_prices.json"
+
+          try:
+              with open(STATE, "r", encoding="utf-8") as f:
+                  old = json.load(f)
+          except FileNotFoundError:
+              old = {}
+
+          def change(now, previous):
+              if previous is None or previous == 0:
+                  return "➖"
+
+              pct = (now - previous) / previous * 100
+
+              if pct > 0:
+                  return f"🔵 +{pct:.2f}%"
+
+              if pct < 0:
+                  return f"🔴 {pct:.2f}%"
+
+              return "➖ 0.00%"
+
+          def toman(n):
+              return f"{round(n):,}"
+
+          now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+          text = (
+              "📊 قیمت طلا و ارز ایران\n"
+              f"🕐 بروزرسانی: {now}\n\n"
+              f"🥇 اونس طلا: {ounce:,.2f} دلار\n"
+              f"🟡 طلای ۱۸ عیار: {toman(gold18)} تومان\n"
+              f"💵 دلار: {toman(usd)} تومان\n"
+              f"💶 یورو: {toman(eur)} تومان\n"
+              f"₮ تتر: {toman(usdt)} تومان\n\n"
+              "📈 تغییر نسبت به ساعت قبل:\n"
+              f"اونس طلا: {change(ounce, old.get('ounce'))}\n"
+              f"طلای ۱۸: {change(gold18, old.get('gold18'))}\n"
+              f"دلار: {change(usd, old.get('usd'))}\n"
+              f"یورو: {change(eur, old.get('eur'))}\n"
+              f"تتر: {change(usdt, old.get('usdt'))}\n\n"
+              "منبع قیمت: Arzbin"
+          )
+
+          url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+          r = requests.post(
+              url,
+              json={
+                  "chat_id": CHANNEL,
+                  "text": text
+              },
+              timeout=30
+          )
+
+          r.raise_for_status()
+
+          new_prices = {
+              "ounce": ounce,
+              "gold18": gold18,
+              "usd": usd,
+              "eur": eur,
+              "usdt": usdt
+          }
+
+          with open(STATE, "w", encoding="utf-8") as f:
+              json.dump(new_prices, f)
+
+          print(text)
           PY
-
-          python bot.py
 
       - name: Save previous prices
         run: |
